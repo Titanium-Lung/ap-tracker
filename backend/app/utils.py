@@ -131,6 +131,78 @@ def get_web_base_url(hostname: str) -> str:
     scheme = "http" if use_http else "https"
     return f"{scheme}://{hostname}"
 
+# Hosts running a custom (non-official-WebHost) Archipelago frontend that
+# exposes an /api/ap_compat/<room_id> endpoint in the shape this app expects,
+# instead of the official /api/room_status/<room_id> + /api/tracker/<id> pair.
+# Add new hostnames here as more custom sites are supported.
+CUSTOM_AP_HOSTS = {"archipelago.csh.rit.edu", "archipelago-dev.cs.house"}
+
+
+async def verify_custom_ap_server(hostname: str, room_id: str, connector, ssl_context):
+    """
+    Verification path for CUSTOM_AP_HOSTS. Mirrors verify_ap_server's return
+    shape, but reads from the site's own /api/room, /api/players, and
+    /api/ap_compat endpoints instead of the official WebHost's room_status API.
+    """
+    base_url = get_web_base_url(hostname)
+
+    async with aiohttp.ClientSession(connector=connector, connector_owner=True) as session:
+        try:
+            async with session.get(f"{base_url}/api/room/{room_id}", timeout=aiohttp.ClientTimeout(total=30)) as resp:
+                if resp.status == 404:
+                    raise ValueError(f"Room {room_id} not found on server {hostname}.")
+                resp.raise_for_status()
+                room_data = json.loads(await resp.text())
+
+            port = room_data.get('port')
+            if not port:
+                raise ValueError("Could not find server port from room info.")
+
+            async with session.get(f"{base_url}/api/players/{room_id}", timeout=aiohttp.ClientTimeout(total=30)) as resp:
+                resp.raise_for_status()
+                players_data = json.loads(await resp.text())
+        except ValueError:
+            raise
+        except Exception as e:
+            raise ValueError(f"Could not connect to the room to verify its status: {e}")
+
+        players_raw = players_data.get('players', [])
+        # This site's /api/players returns {"slot": int, "name": str, "game": str, ...}
+        # dicts (unordered), unlike the official WebHost's ordered [name, game] pairs,
+        # so we sort by slot explicitly rather than assuming list order = slot order.
+        players_sorted = sorted(players_raw, key=lambda p: p.get('slot', 0))
+        player_list = [{'slot_id': p['slot'], 'name': p['name'], 'game': p['game']} for p in players_sorted]
+        total_slots = len(player_list)
+        players_json = json.dumps(player_list)
+
+        # Confirm the game server itself is reachable, same handshake as the
+        # official path -- this just verifies the port, no data comes from it.
+        ws_success = False
+        for uri in (f"wss://{hostname}:{port}", f"ws://{hostname}:{port}"):
+            try:
+                async with session.ws_connect(uri, timeout=10) as ws:
+                    msg = await ws.receive(timeout=10)
+                    if msg.type == aiohttp.WSMsgType.TEXT:
+                        room_info_msg = json.loads(msg.data)
+                        if isinstance(room_info_msg, list) and room_info_msg and room_info_msg[0].get('cmd') == 'RoomInfo':
+                            ws_success = True
+                            break
+            except Exception:
+                pass
+
+        if not ws_success:
+            raise ValueError("Failed to perform Archipelago server handshake. Ensure the server is running and accessible.")
+
+        return {
+            'hostname': hostname,
+            'room_id': room_id,
+            'ap_tracker_id': room_id,  # this site has no separate tracker id; room_id doubles as one
+            'cached_full_address': f"{hostname}:{port}",
+            'cached_players_json': players_json,
+            'cached_total_slots': total_slots,
+        }
+
+
 async def verify_ap_server(hostname: str, room_id: str):
     """
     Verifies that the given Archipelago server URL is valid and reachable.
@@ -145,7 +217,10 @@ async def verify_ap_server(hostname: str, room_id: str):
 
     # Pass the customized bundle context down into your secure custom connector
     connector = SSRFProtectedTCPConnector(ssl=ssl_context)
-    
+
+    if hostname.split(':')[0] in CUSTOM_AP_HOSTS:
+        return await verify_custom_ap_server(hostname, room_id, connector, ssl_context)
+
     async with aiohttp.ClientSession(connector=connector, connector_owner=True) as session:
         # Step 1: Check room status endpoint
         base_url = get_web_base_url(hostname)

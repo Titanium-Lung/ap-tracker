@@ -26,7 +26,7 @@ from .models import (
     User, Device, TrackedRoom, UserRoomSubscription, UserTrackedSlot,
     DatapackageCache, NotifiedItem, NotifiedHint, ThresholdGroup, ThresholdGroupItem, SlotItemCount
 )
-from .utils import get_user_agent_string, get_cheese_headers, extract_ap_room_id, fetch_json_with_status, db_suspend_room, is_snoozed, SSRFProtectedTCPConnector, generate_negative_id, evaluate_finished, resolve_finished_definition, serialize_cached_checks, parse_cached_checks
+from .utils import get_user_agent_string, get_cheese_headers, extract_ap_room_id, fetch_json_with_status, db_suspend_room, is_snoozed, SSRFProtectedTCPConnector, generate_negative_id, evaluate_finished, resolve_finished_definition, serialize_cached_checks, parse_cached_checks, CUSTOM_AP_HOSTS
 # Single source of truth for Cheese sync. This module used to carry its own
 # copy, which silently went stale; re-exported here because run_cheese_poll
 # and api_cheese.refresh_tracker_cache both reach for app.poller.
@@ -1665,18 +1665,27 @@ async def run_room_poll(room_info, loop):
 
     if not tracker_id: return
 
-    # --- GATEKEEPER START ---
-    status_url = f"https://{hostname}/api/room_status/{room_uuid}"
-    status_data, status_code = await fetch_json_with_status(status_url)
-
     # Variables to track what we find
     current_remote_activity = None
     new_full_address = None
-    
+
     # Default to TRUE (Poll) for safety. We only set to False if we prove nothing changed.
     should_fetch_tracker = True
 
-    if status_code == 404:
+    is_custom_host = hostname.split(':')[0] in CUSTOM_AP_HOSTS
+
+    # --- GATEKEEPER START ---
+    # CUSTOM_AP_HOSTS have no lightweight room_status endpoint to cheaply
+    # check first, so we skip the gate entirely and always do a full poll.
+    if is_custom_host:
+        should_fetch_tracker = True
+        status_code = 200
+        status_data = None
+    else:
+        status_url = f"https://{hostname}/api/room_status/{room_uuid}"
+        status_data, status_code = await fetch_json_with_status(status_url)
+
+    if not is_custom_host and status_code == 404:
         await loop.run_in_executor(None, db_suspend_room, db_id, "404 Not Found (Gatekeeper)")
         return # STOP POLLING IMMEDIATELY
 
@@ -1758,7 +1767,10 @@ async def run_room_poll(room_info, loop):
             logging.warning(f"[HIGH_LOAD] Room {db_id} waited {wait_duration:.2f}s for semaphore.")
             
         # 1. FETCH THE DATA
-        tracker_data = await fetch_json(f"https://{hostname}/api/tracker/{tracker_id}")
+        if is_custom_host:
+            tracker_data = await fetch_json(f"https://{hostname}/api/ap_compat/{tracker_id}")
+        else:
+            tracker_data = await fetch_json(f"https://{hostname}/api/tracker/{tracker_id}")
 
     # 2. CHECK IF DATA EXISTS
     if not tracker_data:
@@ -1909,6 +1921,32 @@ def db_read_room_poll_state(db_id):
 # SETUP LOGIC
 # =============================================================================
 
+async def fetch_csh_room_status(hostname, room_uuid):
+    """
+    Builds a room_status-shaped dict for CUSTOM_AP_HOSTS sites (see
+    utils.CUSTOM_AP_HOSTS), which don't have an official-WebHost-style
+    /api/room_status endpoint. Reuses room_uuid as the "tracker id" since
+    these sites have no separate concept -- /api/ap_compat/<room_id> takes
+    the room id directly.
+    """
+    room_info = await fetch_json(f"https://{hostname}/api/room/{room_uuid}")
+    players_resp = await fetch_json(f"https://{hostname}/api/players/{room_uuid}")
+    compat = await fetch_json(f"https://{hostname}/api/ap_compat/{room_uuid}")
+
+    if not room_info or not players_resp:
+        return None
+
+    players_sorted = sorted(players_resp.get('players', []), key=lambda p: p.get('slot', 0))
+    players_pairs = [[p['name'], p['game']] for p in players_sorted]
+
+    return {
+        'players': players_pairs,
+        'tracker': room_uuid,
+        'last_port': room_info.get('port'),
+        'last_activity': (compat or {}).get('last_activity'),
+    }
+
+
 async def run_room_setup(room_info, loop):
     """
     Performs setup for a new room, including fetching static tracker data
@@ -1924,7 +1962,10 @@ async def run_room_setup(room_info, loop):
     last_activity_dt = None
     
     try:
-        room_status = await fetch_json(f"https://{hostname}/api/room_status/{room_uuid}")
+        if hostname.split(':')[0] in CUSTOM_AP_HOSTS:
+            room_status = await fetch_csh_room_status(hostname, room_uuid)
+        else:
+            room_status = await fetch_json(f"https://{hostname}/api/room_status/{room_uuid}")
         if not room_status:
             logging.error(f"[POLLER_SETUP_ERROR][RoomDBID:{db_id}] Failed to fetch room status.")
             await loop.run_in_executor(None, db_handle_setup_failure, db_id)
@@ -1956,9 +1997,12 @@ async def run_room_setup(room_info, loop):
             logging.info(f"[POLLER_SETUP][RoomDBID:{db_id}] Found {len(players)} players. Initializing cache.")
         # ------------------------------
 
-        tracker_url = f"https://{hostname}/api/tracker/{new_tracker_id}"
-        tracker_data = await fetch_json(tracker_url)
-        
+        if hostname.split(':')[0] in CUSTOM_AP_HOSTS:
+            tracker_data = await fetch_json(f"https://{hostname}/api/ap_compat/{new_tracker_id}")
+        else:
+            tracker_url = f"https://{hostname}/api/tracker/{new_tracker_id}"
+            tracker_data = await fetch_json(tracker_url)
+
         finished_slots = set()
         if tracker_data:
             statuses = tracker_data.get('player_status', {})
@@ -1969,8 +2013,12 @@ async def run_room_setup(room_info, loop):
                     if isinstance(s, dict) and s.get('status') == 30:
                         finished_slots.add(s.get('player'))
 
-        static_tracker_url = f"https://{hostname}/api/static_tracker/{new_tracker_id}"
-        static_data = await fetch_json(static_tracker_url)
+        if hostname.split(':')[0] in CUSTOM_AP_HOSTS:
+            # ap_compat already returns player_locations_total, no second call needed
+            static_data = tracker_data
+        else:
+            static_tracker_url = f"https://{hostname}/api/static_tracker/{new_tracker_id}"
+            static_data = await fetch_json(static_tracker_url)
 
         if not static_data:
              logging.warning(f"[POLLER_SETUP_WARN][RoomDBID:{db_id}] Failed to fetch static tracker data. Aborting setup to avoid saving 0s.")
