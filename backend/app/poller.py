@@ -1,3 +1,7 @@
+"""
+THIS FILE altered from the original by Titanium-Lung
+"""
+
 import asyncio
 import logging
 import aiohttp
